@@ -135,9 +135,7 @@ def init_worker(queue, arguments):
 
     os.makedirs(a.output_dir, exist_ok=True)
 
-    if h.get('multispkr', None):
-        spkrs = random.sample(range(len(dataset.id_to_spkr)), k=min(5, len(dataset.id_to_spkr)))
-
+    # spkrs =
     if a.f0_stats and h.get('f0', None) is not None:
         f0_stats = torch.load(a.f0_stats)
 

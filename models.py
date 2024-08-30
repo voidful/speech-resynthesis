@@ -127,10 +127,7 @@ class CodeGenerator(Generator):
         super().__init__(h)
         self.dict = nn.Embedding(h.num_embeddings, h.embedding_dim)
         self.f0 = h.get('f0', None)
-        self.multispkr = h.get('multispkr', None)
-
-        if self.multispkr:
-            self.spkr = nn.Embedding(200, h.embedding_dim)
+        self.spkr = nn.Linear(512, h.embedding_dim)
 
         self.encoder = None
         self.vq = None
@@ -211,10 +208,9 @@ class CodeGenerator(Generator):
                 kwargs['f0'] = self._upsample(kwargs['f0'], x.shape[-1])
             x = torch.cat([x, kwargs['f0']], dim=1)
 
-        if self.multispkr:
-            spkr = self.spkr(kwargs['spkr']).transpose(1, 2)
-            spkr = self._upsample(spkr, x.shape[-1])
-            x = torch.cat([x, spkr], dim=1)
+        spkr = self.spkr(kwargs['spkr'])
+        spkr = self._upsample(spkr, x.shape[-1])
+        x = torch.cat([x, spkr], dim=1)
 
         for k, feat in kwargs.items():
             if k in ['spkr', 'code', 'f0']:

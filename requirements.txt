@@ -1,10 +1,11 @@
-torch==1.8.0
-numpy
-librosa==0.8.1
 scipy
-tensorboard
+tensorboardpyth
 soundfile
 amfm_decompy
 matplotlib
 ffmpeg
 tqdm
+speechbrain
+torch==2.0.1
+numpy==1.23
+librosa==0.8.1

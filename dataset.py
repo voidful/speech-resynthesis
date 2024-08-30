@@ -1,11 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Adapted from https://github.com/jik876/hifi-gan
-
 import random
 from pathlib import Path
 
@@ -15,9 +7,10 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.utils.data
-import torch.utils.data
 from librosa.filters import mel as librosa_mel_fn
 from librosa.util import normalize
+from speechbrain.inference.speaker import EncoderClassifier
+from tqdm.auto import tqdm
 
 MAX_WAV_VALUE = 32768.0
 
@@ -26,16 +19,22 @@ def get_yaapt_f0(audio, rate=16000, interp=False):
     frame_length = 20.0
     to_pad = int(frame_length / 1000 * rate) // 2
 
+    if len(audio.shape) > 1:
+        audio = audio.squeeze()
+
+    if len(audio.shape) != 1:
+        raise ValueError("Audio should be a one-dimensional array, but got shape: {}".format(audio.shape))
+
     f0s = []
-    for y in audio.astype(np.float64):
-        y_pad = np.pad(y.squeeze(), (to_pad, to_pad), "constant", constant_values=0)
-        signal = basic.SignalObj(y_pad, rate)
-        pitch = pYAAPT.yaapt(signal, **{'frame_length': frame_length, 'frame_space': 5.0, 'nccf_thresh1': 0.25,
-                                        'tda_frame_length': 25.0})
-        if interp:
-            f0s += [pitch.samp_interp[None, None, :]]
-        else:
-            f0s += [pitch.samp_values[None, None, :]]
+    audio = audio.astype(np.float64)
+    y_pad = np.pad(audio, (to_pad, to_pad), "constant", constant_values=0)
+    signal = basic.SignalObj(y_pad, rate)
+    pitch = pYAAPT.yaapt(signal, **{'frame_length': frame_length, 'frame_space': 5.0, 'nccf_thresh1': 0.25,
+                                    'tda_frame_length': 25.0})
+    if interp:
+        f0s.append(pitch.samp_interp[None, None, :])
+    else:
+        f0s.append(pitch.samp_values[None, None, :])
 
     f0 = np.vstack(f0s)
     return f0
@@ -50,25 +49,26 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     global mel_basis, hann_window
     if fmax not in mel_basis:
         mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+        mel_basis[str(fmax) + '_' + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
-    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
+    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+                                mode='reflect')
     y = y.squeeze(1)
 
     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
                       center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
 
-    spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
+    spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
 
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis[str(fmax) + '_' + str(y.device)], spec)
     spec = spectral_normalize_torch(spec)
 
     return spec
 
 
 def load_audio(full_path):
-    data, sampling_rate = sf.read(full_path, dtype='int16')
+    data, sampling_rate = sf.read(full_path, dtype='float64')
     return data, sampling_rate
 
 
@@ -181,20 +181,34 @@ class CodeDataset(torch.utils.data.Dataset):
         self.f0 = f0
         self.f0_normalize = f0_normalize
         self.f0_feats = f0_feats
-        self.f0_stats = None
+        self.f0_stats = f0_stats
         self.f0_interp = f0_interp
         self.f0_median = f0_median
-        if f0_stats:
-            self.f0_stats = torch.load(f0_stats)
         self.multispkr = multispkr
         self.pad = pad
-        if self.multispkr:
-            spkrs = [parse_speaker(f, self.multispkr) for f in self.audio_files]
-            spkrs = list(set(spkrs))
-            spkrs.sort()
 
-            self.id_to_spkr = spkrs
-            self.spkr_to_id = {k: v for v, k in enumerate(self.id_to_spkr)}
+        if f0_stats is None:
+            self.f0_stats = self._compute_f0_stats()
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if multispkr:
+            self.spek_emb = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb",
+                                                           savedir="pretrained_models/spkrec-xvect-voxceleb",
+                                                           run_opts={"device": device})
+
+    def _compute_f0_stats(self):
+        """Compute global f0 mean and std from the dataset."""
+        f0_values = []
+        for filename in tqdm(self.audio_files):
+            audio, _ = load_audio(filename)
+            f0 = get_yaapt_f0(audio, rate=self.sampling_rate, interp=self.f0_interp)
+            f0_values.append(f0[f0 > 0])
+
+        f0_values = np.concatenate(f0_values)
+        f0_mean = np.mean(f0_values)
+        f0_std = np.std(f0_values)
+
+        return {'f0_mean': f0_mean, 'f0_std': f0_std}
 
     def _sample_interval(self, seqs, seq_len=None):
         N = max([v.shape[-1] for v in seqs])
@@ -204,7 +218,6 @@ class CodeDataset(torch.utils.data.Dataset):
         hops = [N // v.shape[-1] for v in seqs]
         lcm = np.lcm.reduce(hops)
 
-        # Randomly pickup with the batch_max_steps length of the part
         interval_start = 0
         interval_end = N // lcm - seq_len // lcm
 
@@ -223,8 +236,6 @@ class CodeDataset(torch.utils.data.Dataset):
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_audio(filename)
             if sampling_rate != self.sampling_rate:
-                # raise ValueError("{} SR doesn't match target {} SR".format(
-                #     sampling_rate, self.sampling_rate))
                 import resampy
                 audio = resampy.resample(audio, sampling_rate, self.sampling_rate)
 
@@ -239,7 +250,6 @@ class CodeDataset(torch.utils.data.Dataset):
             audio = self.cached_wav
             self._cache_ref_count -= 1
 
-        # Trim audio ending
         if self.vqvae:
             code_length = audio.shape[0] // self.code_hop_size
         else:
@@ -282,17 +292,11 @@ class CodeDataset(torch.utils.data.Dataset):
             feats['f0'] = f0.squeeze(0)
 
         if self.multispkr:
-            feats['spkr'] = self._get_spkr(index)
+            feats['spkr'] = self._get_spkr_embedding(audio)
 
         if self.f0_normalize:
-            spkr_id = self._get_spkr(index).item()
-
-            if spkr_id not in self.f0_stats:
-                mean = self.f0_stats['f0_mean']
-                std = self.f0_stats['f0_std']
-            else:
-                mean = self.f0_stats[spkr_id]['f0_mean']
-                std = self.f0_stats[spkr_id]['f0_std']
+            mean = self.f0_stats['f0_mean']
+            std = self.f0_stats['f0_std']
             ii = feats['f0'] != 0
 
             if self.f0_median:
@@ -307,10 +311,9 @@ class CodeDataset(torch.utils.data.Dataset):
 
         return feats, audio.squeeze(0), str(filename), mel_loss.squeeze()
 
-    def _get_spkr(self, idx):
-        spkr_name = parse_speaker(self.audio_files[idx], self.multispkr)
-        spkr_id = torch.LongTensor([self.spkr_to_id[spkr_name]]).view(1).numpy()
-        return spkr_id
+    def _get_spkr_embedding(self, audio):
+        embeddings = self.spek_emb.encode_batch(audio).squeeze()
+        return embeddings.detach().cpu().numpy()
 
     def __len__(self):
         return len(self.audio_files)
@@ -336,17 +339,27 @@ class F0Dataset(torch.utils.data.Dataset):
         self.f0_stats = None
         self.f0_interp = f0_interp
         self.f0_median = f0_median
-        if f0_stats:
-            self.f0_stats = torch.load(f0_stats)
         self.pad = pad
         self.multispkr = multispkr
-        if self.multispkr:
-            spkrs = [parse_speaker(f, self.multispkr) for f in self.audio_files]
-            spkrs = list(set(spkrs))
-            spkrs.sort()
 
-            self.id_to_spkr = spkrs
-            self.spkr_to_id = {k: v for v, k in enumerate(self.id_to_spkr)}
+        if f0_stats is not None:
+            self.f0_stats = torch.load(f0_stats)
+        else:
+            self.f0_stats = self._compute_f0_stats()
+
+    def _compute_f0_stats(self):
+        """Compute global f0 mean and std from the dataset."""
+        f0_values = []
+        for filename in tqdm(self.audio_files):
+            audio, _ = load_audio(filename)
+            f0 = get_yaapt_f0(audio, rate=self.sampling_rate, interp=self.f0_interp)
+            f0_values.append(f0[f0 > 0])
+
+        f0_values = np.concatenate(f0_values)
+        f0_mean = np.mean(f0_values)
+        f0_std = np.std(f0_values)
+
+        return {'f0_mean': f0_mean, 'f0_std': f0_std}
 
     def _sample_interval(self, seqs, seq_len=None):
         N = max([v.shape[-1] for v in seqs])
@@ -356,7 +369,6 @@ class F0Dataset(torch.utils.data.Dataset):
         hops = [N // v.shape[-1] for v in seqs]
         lcm = np.lcm.reduce(hops)
 
-        # Randomly pickup with the batch_max_steps length of the part
         interval_start = 0
         interval_end = N // lcm - seq_len // lcm
 
@@ -405,18 +417,9 @@ class F0Dataset(torch.utils.data.Dataset):
         f0 = f0.astype(np.float32)
         feats['f0'] = f0.squeeze(0)
 
-        if self.multispkr:
-            feats['spkr'] = self._get_spkr(index)
-
         if self.f0_normalize:
-            spkr_id = self._get_spkr(index).item()
-
-            if spkr_id not in self.f0_stats:
-                mean = self.f0_stats['f0_mean']
-                std = self.f0_stats['f0_std']
-            else:
-                mean = self.f0_stats[spkr_id]['f0_mean']
-                std = self.f0_stats[spkr_id]['f0_std']
+            mean = self.f0_stats['f0_mean']
+            std = self.f0_stats['f0_std']
             ii = feats['f0'] != 0
 
             if self.f0_median:
@@ -430,11 +433,6 @@ class F0Dataset(torch.utils.data.Dataset):
                 feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
 
         return feats, feats['f0'], str(filename)
-
-    def _get_spkr(self, idx):
-        spkr_name = parse_speaker(self.audio_files[idx], self.multispkr)
-        spkr_id = torch.LongTensor([self.spkr_to_id[spkr_name]]).view(1).numpy()
-        return spkr_id
 
     def __len__(self):
         return len(self.audio_files)
