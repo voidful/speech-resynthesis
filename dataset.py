@@ -233,83 +233,90 @@ class CodeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
-        if self._cache_ref_count == 0:
-            audio, sampling_rate = load_audio(filename)
-            if sampling_rate != self.sampling_rate:
-                import resampy
-                audio = resampy.resample(audio, sampling_rate, self.sampling_rate)
+        try:
+            if self._cache_ref_count == 0:
+                audio, sampling_rate = load_audio(filename)
+                if sampling_rate != self.sampling_rate:
+                    import resampy
+                    audio = resampy.resample(audio, sampling_rate, self.sampling_rate)
 
-            if self.pad:
-                padding = self.pad - (audio.shape[-1] % self.pad)
-                audio = np.pad(audio, (0, padding), "constant", constant_values=0)
-            audio = audio / MAX_WAV_VALUE
-            audio = normalize(audio) * 0.95
-            self.cached_wav = audio
-            self._cache_ref_count = self.n_cache_reuse
-        else:
-            audio = self.cached_wav
-            self._cache_ref_count -= 1
+                if self.pad:
+                    padding = self.pad - (audio.shape[-1] % self.pad)
+                    audio = np.pad(audio, (0, padding), "constant", constant_values=0)
+                audio = audio / MAX_WAV_VALUE
+                audio = normalize(audio) * 0.95
+                self.cached_wav = audio
+                self._cache_ref_count = self.n_cache_reuse
+            else:
+                audio = self.cached_wav
+                self._cache_ref_count -= 1
 
-        if self.vqvae:
-            code_length = audio.shape[0] // self.code_hop_size
-        else:
-            code_length = min(audio.shape[0] // self.code_hop_size, self.codes[index].shape[0])
-            code = self.codes[index][:code_length]
-        audio = audio[:code_length * self.code_hop_size]
-        assert self.vqvae or audio.shape[0] // self.code_hop_size == code.shape[0], "Code audio mismatch"
+            if self.vqvae:
+                code_length = audio.shape[0] // self.code_hop_size
+            else:
+                code_length = min(audio.shape[0] // self.code_hop_size, self.codes[index].shape[0])
+                code = self.codes[index][:code_length]
+            audio = audio[:code_length * self.code_hop_size]
+            assert self.vqvae or audio.shape[0] // self.code_hop_size == code.shape[0], "Code audio mismatch"
 
-        while audio.shape[0] < self.segment_size:
-            audio = np.hstack([audio, audio])
-            if not self.vqvae:
-                code = np.hstack([code, code])
+            while audio.shape[0] < self.segment_size:
+                audio = np.hstack([audio, audio])
+                if not self.vqvae:
+                    code = np.hstack([code, code])
 
-        audio = torch.FloatTensor(audio)
-        audio = audio.unsqueeze(0)
+            audio = torch.FloatTensor(audio)
+            audio = audio.unsqueeze(0)
 
-        assert audio.size(1) >= self.segment_size, "Padding not supported!!"
-        if self.vqvae:
-            audio = self._sample_interval([audio])[0]
-        else:
-            audio, code = self._sample_interval([audio, code])
+            assert audio.size(1) >= self.segment_size, "Padding not supported!!"
+            if self.vqvae:
+                audio = self._sample_interval([audio])[0]
+            else:
+                audio, code = self._sample_interval([audio, code])
 
-        mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
-                                   center=False)
+            mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
+                                       self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
+                                       center=False)
 
-        if self.vqvae:
-            feats = {
-                "code": audio.view(1, -1).numpy()
-            }
-        else:
-            feats = {"code": code.squeeze()}
+            if self.vqvae:
+                feats = {
+                    "code": audio.view(1, -1).numpy()
+                }
+            else:
+                feats = {"code": code.squeeze()}
 
-        if self.f0:
-            try:
-                f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
-            except:
-                f0 = np.zeros((1, 1, audio.shape[-1] // 80))
-            f0 = f0.astype(np.float32)
-            feats['f0'] = f0.squeeze(0)
+            if self.f0:
+                try:
+                    f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+                except ValueError as e:
+                    print(f"Skipping {filename} due to F0 extraction error: {e}")
+                    return self.__getitem__((index + 1) % len(self.audio_files))  # Skip to the next file
 
-        if self.multispkr:
-            feats['spkr'] = self._get_spkr_embedding(audio)
+                f0 = f0.astype(np.float32)
+                feats['f0'] = f0.squeeze(0)
 
-        if self.f0_normalize:
-            mean = self.f0_stats['f0_mean']
-            std = self.f0_stats['f0_std']
-            ii = feats['f0'] != 0
+            if self.multispkr:
+                feats['spkr'] = self._get_spkr_embedding(audio)
 
-            if self.f0_median:
-                med = np.median(feats['f0'][ii])
-                feats['f0'][~ii] = med
-                feats['f0'][~ii] = (feats['f0'][~ii] - mean) / std
+            if self.f0_normalize:
+                mean = self.f0_stats['f0_mean']
+                std = self.f0_stats['f0_std']
+                ii = feats['f0'] != 0
 
-            feats['f0'][ii] = (feats['f0'][ii] - mean) / std
+                if self.f0_median:
+                    med = np.median(feats['f0'][ii])
+                    feats['f0'][~ii] = med
+                    feats['f0'][~ii] = (feats['f0'][~ii] - mean) / std
 
-            if self.f0_feats:
-                feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
+                feats['f0'][ii] = (feats['f0'][ii] - mean) / std
 
-        return feats, audio.squeeze(0), str(filename), mel_loss.squeeze()
+                if self.f0_feats:
+                    feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
+
+            return feats, audio.squeeze(0), str(filename), mel_loss.squeeze()
+
+        except Exception as e:
+            print(f"Skipping {filename} due to error: {e}")
+            return self.__getitem__((index + 1) % len(self.audio_files))  # Skip to the next file
 
     def _get_spkr_embedding(self, audio):
         embeddings = self.spek_emb.encode_batch(audio).squeeze()
@@ -384,55 +391,62 @@ class F0Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
-        if self._cache_ref_count == 0:
-            audio, sampling_rate = load_audio(filename)
-            if self.pad:
-                padding = self.pad - (audio.shape[-1] % self.pad)
-                audio = np.pad(audio, (0, padding), "constant", constant_values=0)
-            audio = audio / MAX_WAV_VALUE
-            audio = normalize(audio) * 0.95
-            self.cached_wav = audio
-            if sampling_rate != self.sampling_rate:
-                raise ValueError("{} SR doesn't match target {} SR".format(
-                    sampling_rate, self.sampling_rate))
-            self._cache_ref_count = self.n_cache_reuse
-        else:
-            audio = self.cached_wav
-            self._cache_ref_count -= 1
-
-        while audio.shape[0] < self.segment_size:
-            audio = np.hstack([audio, audio])
-
-        audio = torch.FloatTensor(audio)
-        audio = audio.unsqueeze(0)
-
-        assert audio.size(1) >= self.segment_size, "Padding not supported!!"
-        audio = self._sample_interval([audio])[0]
-
-        feats = {}
         try:
-            f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
-        except:
-            f0 = np.zeros((1, 1, audio.shape[-1] // 80))
-        f0 = f0.astype(np.float32)
-        feats['f0'] = f0.squeeze(0)
+            if self._cache_ref_count == 0:
+                audio, sampling_rate = load_audio(filename)
+                if self.pad:
+                    padding = self.pad - (audio.shape[-1] % self.pad)
+                    audio = np.pad(audio, (0, padding), "constant", constant_values=0)
+                audio = audio / MAX_WAV_VALUE
+                audio = normalize(audio) * 0.95
+                self.cached_wav = audio
+                if sampling_rate != self.sampling_rate:
+                    raise ValueError("{} SR doesn't match target {} SR".format(
+                        sampling_rate, self.sampling_rate))
+                self._cache_ref_count = self.n_cache_reuse
+            else:
+                audio = self.cached_wav
+                self._cache_ref_count -= 1
 
-        if self.f0_normalize:
-            mean = self.f0_stats['f0_mean']
-            std = self.f0_stats['f0_std']
-            ii = feats['f0'] != 0
+            while audio.shape[0] < self.segment_size:
+                audio = np.hstack([audio, audio])
 
-            if self.f0_median:
-                med = np.median(feats['f0'][ii])
-                feats['f0'][~ii] = med
-                feats['f0'][~ii] = (feats['f0'][~ii] - mean) / std
+            audio = torch.FloatTensor(audio)
+            audio = audio.unsqueeze(0)
 
-            feats['f0'][ii] = (feats['f0'][ii] - mean) / std
+            assert audio.size(1) >= self.segment_size, "Padding not supported!!"
+            audio = self._sample_interval([audio])[0]
 
-            if self.f0_feats:
-                feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
+            feats = {}
+            try:
+                f0 = get_yaapt_f0(audio.numpy(), rate=self.sampling_rate, interp=self.f0_interp)
+            except ValueError as e:
+                print(f"Skipping {filename} due to F0 extraction error: {e}")
+                return self.__getitem__((index + 1) % len(self.audio_files))  # Skip to the next file
 
-        return feats, feats['f0'], str(filename)
+            f0 = f0.astype(np.float32)
+            feats['f0'] = f0.squeeze(0)
+
+            if self.f0_normalize:
+                mean = self.f0_stats['f0_mean']
+                std = self.f0_stats['f0_std']
+                ii = feats['f0'] != 0
+
+                if self.f0_median:
+                    med = np.median(feats['f0'][ii])
+                    feats['f0'][~ii] = med
+                    feats['f0'][~ii] = (feats['f0'][~ii] - mean) / std
+
+                feats['f0'][ii] = (feats['f0'][ii] - mean) / std
+
+                if self.f0_feats:
+                    feats['f0_stats'] = torch.FloatTensor([mean, std]).view(-1).numpy()
+
+            return feats, feats['f0'], str(filename)
+
+        except Exception as e:
+            print(f"Skipping {filename} due to error: {e}")
+            return self.__getitem__((index + 1) % len(self.audio_files))  # Skip to the next file
 
     def __len__(self):
         return len(self.audio_files)
