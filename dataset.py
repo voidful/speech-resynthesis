@@ -187,7 +187,7 @@ class CodeDataset(torch.utils.data.Dataset):
         self.multispkr = multispkr
         self.pad = pad
 
-        if f0_stats is None:
+        if f0_stats is None and f0_normalize:
             self.f0_stats = self._compute_f0_stats()
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
