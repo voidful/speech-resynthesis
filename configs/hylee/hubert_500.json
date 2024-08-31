@@ -22,14 +22,14 @@
 
     "segment_size": 8960,
     "code_hop_size": 160,
-    "f0": true,
+    "f0": false,
     "num_mels": 80,
     "num_freq": 1025,
     "n_fft": 1024,
     "hop_size": 256,
     "win_size": 1024,
 
-    "f0_normalize": true,
+    "f0_normalize": false,
     "f0_feats": false,
     "f0_median": false,
     "f0_interp": false,
