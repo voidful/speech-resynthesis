@@ -285,6 +285,7 @@ def train(rank, local_rank, a, h):
 
 
 def main():
+    torch.multiprocessing.set_start_method('spawn')
     print('Initializing Training Process..')
 
     parser = argparse.ArgumentParser()
